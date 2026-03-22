@@ -15,7 +15,8 @@ Open [http://localhost:8000](http://localhost:8000).
 
 - `W A S D`: Move
 - `Shift`: Sprint
-- Hold **left mouse button** + drag: Orbit third-person camera
+- `Space`: Jump
+- Hold **right mouse button** + drag: Orbit third-person camera
 - Mouse wheel: Zoom camera in/out
 - `F`: Turn into ragdoll (physics limbs)
 - `R`: Respawn

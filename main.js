@@ -1,15 +1,16 @@
 import * as THREE from "./libs/three.module.js";
 import * as CANNON from "./libs/cannon-es.js";
 
-const WORLD_SIZE = 1400;
+const WORLD_SIZE = 2200;
 const PLAYER_RADIUS = 0.42;
 const WALK_SPEED = 6.8;
 const RUN_SPEED = 10.8;
 const GRAVITY = 26;
+const JUMP_SPEED = 10.2;
 
 const BUILDING_HALF_WIDTH = 14;
 const BUILDING_HALF_DEPTH = 10;
-const BUILDING_HEIGHT = 260;
+const BUILDING_HEIGHT = 560;
 const ROOF_Y = BUILDING_HEIGHT;
 const WALL_THICKNESS = 0.6;
 const WALL_COLLIDER_TOP = ROOF_Y - 2;
@@ -27,6 +28,8 @@ const STAIR_RISE_PER_TURN = STAIR_STEP_RISE * ((Math.PI * 2) / STAIR_STEP_ANGLE)
 const TELEPORT_PAD_POSITION = new THREE.Vector3(BUILDING_HALF_WIDTH + 8, 0.12, -2.4);
 const TELEPORT_RADIUS = 1.6;
 const TELEPORT_DESTINATION = new THREE.Vector3(0, ROOF_Y + 0.05, BUILDING_HALF_DEPTH - 2.4);
+const WALK_CAMERA_DISTANCE = 7.4;
+const RAGDOLL_CAMERA_DISTANCE = 5.6;
 
 const RAGDOLL_SPEC = {
   pelvis: {
@@ -109,9 +112,9 @@ const RAGDOLL_SPEC = {
 };
 
 const scene = new THREE.Scene();
-scene.fog = new THREE.Fog(0x9fcfff, 110, 1200);
+scene.fog = new THREE.Fog(0x9fcfff, 130, 2400);
 
-const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 2600);
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 4600);
 camera.position.set(18, 7, 26);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -131,6 +134,7 @@ const keys = {
   KeyA: false,
   KeyS: false,
   KeyD: false,
+  Space: false,
   ShiftLeft: false,
   ShiftRight: false,
 };
@@ -138,21 +142,23 @@ const keys = {
 let gameStarted = false;
 let mode = "walk";
 
-let isDraggingCamera = false;
+let isRightDraggingCamera = false;
 let cameraYaw = Math.PI * 0.78;
 let cameraPitch = 0.34;
-let cameraDistance = 8.7;
+let cameraDistance = WALK_CAMERA_DISTANCE;
 
 let walkCycle = 0;
 let teleportCooldown = 0;
 let currentStatus = "Climb the stairs to the rooftop, then ragdoll and fall.";
 let grassWindUniformRef = null;
+let jumpQueued = false;
 
 const player = {
   position: new THREE.Vector3(20, 0, 24),
   yaw: Math.PI,
   velocityY: 0,
   velocityXZ: new THREE.Vector3(),
+  grounded: false,
   spawn: new THREE.Vector3(20, 0, 24),
 };
 
@@ -196,7 +202,7 @@ dirLight.shadow.camera.right = 420;
 dirLight.shadow.camera.top = 420;
 dirLight.shadow.camera.bottom = -420;
 dirLight.shadow.camera.near = 10;
-dirLight.shadow.camera.far = 980;
+dirLight.shadow.camera.far = 1800;
 scene.add(dirLight);
 
 const ambientRimLight = new THREE.DirectionalLight(0x8bbdff, 0.25);
@@ -298,6 +304,13 @@ function setupEvents() {
       keys[event.code] = true;
     }
 
+    if (event.code === "Space") {
+      event.preventDefault();
+      if (!event.repeat) {
+        jumpQueued = true;
+      }
+    }
+
     if (event.code === "KeyF" && !event.repeat && gameStarted && mode === "walk") {
       enterRagdollMode();
     }
@@ -317,26 +330,37 @@ function setupEvents() {
     }
   });
 
+  window.addEventListener("blur", () => {
+    for (const keyCode of Object.keys(keys)) {
+      keys[keyCode] = false;
+    }
+    isRightDraggingCamera = false;
+  });
+
+  renderer.domElement.addEventListener("contextmenu", (event) => {
+    event.preventDefault();
+  });
+
   renderer.domElement.addEventListener("pointerdown", (event) => {
-    if (!gameStarted || event.button !== 0) {
+    if (!gameStarted || event.button !== 2) {
       return;
     }
 
-    isDraggingCamera = true;
+    isRightDraggingCamera = true;
     renderer.domElement.setPointerCapture(event.pointerId);
   });
 
   renderer.domElement.addEventListener("pointerup", (event) => {
-    if (event.button !== 0) {
+    if (event.button !== 2) {
       return;
     }
 
-    isDraggingCamera = false;
+    isRightDraggingCamera = false;
     renderer.domElement.releasePointerCapture(event.pointerId);
   });
 
   renderer.domElement.addEventListener("pointermove", (event) => {
-    if (!isDraggingCamera || !gameStarted) {
+    if (!isRightDraggingCamera || !gameStarted) {
       return;
     }
 
@@ -346,8 +370,9 @@ function setupEvents() {
   });
 
   renderer.domElement.addEventListener("wheel", (event) => {
+    event.preventDefault();
     cameraDistance += event.deltaY * 0.01;
-    cameraDistance = THREE.MathUtils.clamp(cameraDistance, 4.8, 14.5);
+    cameraDistance = THREE.MathUtils.clamp(cameraDistance, 4.0, 14.5);
   });
 
   window.addEventListener("resize", () => {
@@ -361,8 +386,8 @@ function updateWalking(delta, elapsed) {
   const forwardInput = Number(keys.KeyW) - Number(keys.KeyS);
   const strafeInput = Number(keys.KeyD) - Number(keys.KeyA);
 
-  tempVecA.set(Math.sin(cameraYaw), 0, Math.cos(cameraYaw));
-  tempVecB.set(tempVecA.z, 0, -tempVecA.x);
+  tempVecA.set(Math.sin(cameraYaw), 0, Math.cos(cameraYaw)).normalize();
+  tempVecB.set(tempVecA.z, 0, -tempVecA.x).normalize();
 
   const moveDir = new THREE.Vector3();
   moveDir.addScaledVector(tempVecA, forwardInput);
@@ -387,19 +412,33 @@ function updateWalking(delta, elapsed) {
 
   const supportHeight = getSupportHeight(player.position.x, player.position.z, player.position.y);
   const stepDiff = supportHeight - player.position.y;
+  let grounded = false;
 
   if (stepDiff <= 0.45 && player.velocityY <= 0) {
-    player.velocityY = 0;
     player.position.y = supportHeight;
-  } else {
+    player.velocityY = 0;
+    grounded = true;
+  }
+
+  if (jumpQueued && grounded) {
+    player.velocityY = JUMP_SPEED;
+    grounded = false;
+  }
+
+  if (!grounded) {
     player.velocityY -= GRAVITY * delta;
     player.position.y += player.velocityY * delta;
 
-    if (player.position.y < supportHeight) {
-      player.position.y = supportHeight;
+    const postFallSupport = getSupportHeight(player.position.x, player.position.z, player.position.y);
+    if (player.position.y < postFallSupport) {
+      player.position.y = postFallSupport;
       player.velocityY = 0;
+      grounded = true;
     }
   }
+
+  player.grounded = grounded;
+  jumpQueued = false;
 
   if (player.position.y < -35) {
     resetToSpawn();
@@ -409,6 +448,11 @@ function updateWalking(delta, elapsed) {
   if (targetVelocity.lengthSq() > 0.2) {
     const desiredYaw = Math.atan2(targetVelocity.x, targetVelocity.z);
     player.yaw = dampAngle(player.yaw, desiredYaw, 12, delta);
+
+    if (!isRightDraggingCamera) {
+      const chaseYaw = desiredYaw + Math.PI;
+      cameraYaw = dampAngle(cameraYaw, chaseYaw, 7.5, delta);
+    }
   }
 
   walkCycle += delta * (3 + player.velocityXZ.length() * 1.2);
@@ -554,21 +598,32 @@ function updateCamera(delta) {
   } else {
     const torso = ragdollBodies.get("torso");
     if (torso) {
-      cameraTarget.set(torso.position.x, torso.position.y + 0.7, torso.position.z);
+      cameraTarget.set(torso.position.x, torso.position.y + 0.48, torso.position.z);
+
+      if (!isRightDraggingCamera) {
+        const horizontalSpeed = Math.hypot(torso.velocity.x, torso.velocity.z);
+        if (horizontalSpeed > 0.35) {
+          const velocityYaw = Math.atan2(torso.velocity.x, torso.velocity.z);
+          cameraYaw = dampAngle(cameraYaw, velocityYaw + Math.PI, 3.4, delta);
+        }
+        cameraPitch = THREE.MathUtils.lerp(cameraPitch, 0.42, 1 - Math.exp(-4 * delta));
+      }
     }
   }
 
+  const modeDistance = mode === "ragdoll" ? Math.min(cameraDistance, RAGDOLL_CAMERA_DISTANCE) : cameraDistance;
   desiredCameraPosition.set(
-    cameraTarget.x + Math.sin(cameraYaw) * Math.cos(cameraPitch) * cameraDistance,
-    cameraTarget.y + Math.sin(cameraPitch) * cameraDistance + 0.5,
-    cameraTarget.z + Math.cos(cameraYaw) * Math.cos(cameraPitch) * cameraDistance
+    cameraTarget.x + Math.sin(cameraYaw) * Math.cos(cameraPitch) * modeDistance,
+    cameraTarget.y + Math.sin(cameraPitch) * modeDistance + 0.5,
+    cameraTarget.z + Math.cos(cameraYaw) * Math.cos(cameraPitch) * modeDistance
   );
 
   if (desiredCameraPosition.y < 0.5) {
     desiredCameraPosition.y = 0.5;
   }
 
-  const cameraBlend = 1 - Math.exp(-10 * delta);
+  const followStrength = mode === "ragdoll" ? 18 : 10;
+  const cameraBlend = 1 - Math.exp(-followStrength * delta);
   camera.position.lerp(desiredCameraPosition, cameraBlend);
   camera.lookAt(cameraTarget);
 }
@@ -611,6 +666,12 @@ function enterRagdollMode() {
 
   ragdollVelocity.copy(moveVel);
   ragdollVelocity.y = player.velocityY;
+
+  if (!isRightDraggingCamera) {
+    cameraYaw = player.yaw + Math.PI;
+    cameraPitch = THREE.MathUtils.clamp(cameraPitch, 0.24, 0.72);
+  }
+  cameraDistance = Math.min(cameraDistance, RAGDOLL_CAMERA_DISTANCE);
 
   syncRagdollVisuals();
   setStatus("Ragdoll active. Watch your limbs crumple. Press R to respawn.");
@@ -703,8 +764,16 @@ function resetToSpawn() {
   player.position.copy(player.spawn);
   player.velocityY = 0;
   player.velocityXZ.set(0, 0, 0);
+  player.grounded = false;
   player.yaw = Math.PI;
   walkCycle = 0;
+  jumpQueued = false;
+
+  if (!isRightDraggingCamera) {
+    cameraYaw = player.yaw + Math.PI;
+    cameraPitch = 0.34;
+  }
+  cameraDistance = WALK_CAMERA_DISTANCE;
 
   setStatus("Reset complete. Climb stairs or use the teleport pad to reach the top quickly.");
 }
@@ -953,7 +1022,7 @@ function createSkyscraper() {
   slab.castShadow = true;
   building.add(slab);
 
-  const rows = 52;
+  const rows = Math.max(72, Math.floor(BUILDING_HEIGHT / 5));
   building.add(
     createFacadeSide({
       width: BUILDING_HALF_WIDTH * 2,
@@ -1318,90 +1387,130 @@ function createHumanoidRig() {
   const group = new THREE.Group();
   group.position.copy(player.position);
 
-  const skin = new THREE.MeshStandardMaterial({ color: 0xd9ab83, roughness: 0.95 });
-  const shirt = new THREE.MeshStandardMaterial({ color: 0x3e6e9d, roughness: 0.84 });
-  const pants = new THREE.MeshStandardMaterial({ color: 0x3c465c, roughness: 0.9 });
-  const shoes = new THREE.MeshStandardMaterial({ color: 0x2a2a31, roughness: 0.88 });
+  const setLit = (mesh) => {
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    return mesh;
+  };
+
+  const skin = new THREE.MeshStandardMaterial({ color: 0xd8a97f, roughness: 0.92 });
+  const shirt = new THREE.MeshStandardMaterial({ color: 0x4575a9, roughness: 0.78, metalness: 0.04 });
+  const shirtDark = new THREE.MeshStandardMaterial({ color: 0x305882, roughness: 0.82, metalness: 0.06 });
+  const pants = new THREE.MeshStandardMaterial({ color: 0x3f4a5e, roughness: 0.86 });
+  const shoes = new THREE.MeshStandardMaterial({ color: 0x1f2229, roughness: 0.84, metalness: 0.12 });
+  const hair = new THREE.MeshStandardMaterial({ color: 0x33261f, roughness: 0.9 });
+
+  const upperArmGeo = new THREE.CapsuleGeometry(0.085, 0.3, 6, 12);
+  const lowerArmGeo = new THREE.CapsuleGeometry(0.075, 0.28, 6, 12);
+  const upperLegGeo = new THREE.CapsuleGeometry(0.11, 0.38, 6, 12);
+  const lowerLegGeo = new THREE.CapsuleGeometry(0.095, 0.36, 6, 12);
 
   const hips = new THREE.Group();
   hips.position.y = 1.06;
   group.add(hips);
 
-  const pelvis = new THREE.Mesh(new THREE.BoxGeometry(0.52, 0.32, 0.3), shirt);
-  pelvis.castShadow = true;
+  const pelvis = setLit(new THREE.Mesh(new THREE.CapsuleGeometry(0.16, 0.2, 6, 16), shirtDark));
+  pelvis.scale.set(1.7, 1.0, 1.15);
   hips.add(pelvis);
 
   const spinePivot = new THREE.Group();
-  spinePivot.position.y = 0.3;
+  spinePivot.position.y = 0.28;
   hips.add(spinePivot);
 
-  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.62, 0.86, 0.36), shirt);
-  torso.position.y = 0.42;
-  torso.castShadow = true;
+  const torso = setLit(new THREE.Mesh(new THREE.CapsuleGeometry(0.24, 0.5, 8, 18), shirt));
+  torso.position.y = 0.47;
+  torso.scale.set(1.2, 1.05, 1.0);
   spinePivot.add(torso);
 
-  const head = new THREE.Mesh(new THREE.SphereGeometry(0.23, 20, 18), skin);
-  head.position.y = 1.02;
-  head.castShadow = true;
+  const chestPlate = setLit(new THREE.Mesh(new THREE.BoxGeometry(0.48, 0.42, 0.16), shirtDark));
+  chestPlate.position.set(0, 0.56, 0.11);
+  spinePivot.add(chestPlate);
+
+  const neck = setLit(new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.1, 0.11, 16), skin));
+  neck.position.y = 0.9;
+  spinePivot.add(neck);
+
+  const head = setLit(new THREE.Mesh(new THREE.SphereGeometry(0.24, 22, 18), skin));
+  head.position.y = 1.14;
   spinePivot.add(head);
 
+  const hairCap = setLit(new THREE.Mesh(new THREE.SphereGeometry(0.245, 20, 14, 0, Math.PI * 2, 0, Math.PI * 0.58), hair));
+  hairCap.position.y = 1.19;
+  spinePivot.add(hairCap);
+
+  const eyeGeo = new THREE.SphereGeometry(0.03, 12, 10);
+  const eyeMat = new THREE.MeshStandardMaterial({ color: 0x1d222b, roughness: 0.55 });
+  const eyeL = new THREE.Mesh(eyeGeo, eyeMat);
+  eyeL.position.set(-0.08, 1.14, 0.205);
+  const eyeR = eyeL.clone();
+  eyeR.position.x *= -1;
+  spinePivot.add(eyeL, eyeR);
+
   const leftShoulder = new THREE.Group();
-  leftShoulder.position.set(-0.43, 0.73, 0);
+  leftShoulder.position.set(-0.43, 0.74, 0);
   spinePivot.add(leftShoulder);
 
-  const leftUpperArm = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.1, 0.48, 14), skin);
-  leftUpperArm.position.y = -0.24;
-  leftUpperArm.castShadow = true;
+  const leftShoulderJoint = setLit(new THREE.Mesh(new THREE.SphereGeometry(0.1, 16, 14), shirtDark));
+  leftShoulder.add(leftShoulderJoint);
+
+  const leftUpperArm = setLit(new THREE.Mesh(upperArmGeo, skin));
+  leftUpperArm.position.y = -0.22;
   leftShoulder.add(leftUpperArm);
 
   const leftElbow = new THREE.Group();
-  leftElbow.position.y = -0.48;
+  leftElbow.position.y = -0.44;
   leftShoulder.add(leftElbow);
 
-  const leftLowerArm = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.09, 0.48, 14), skin);
-  leftLowerArm.position.y = -0.24;
-  leftLowerArm.castShadow = true;
+  const leftLowerArm = setLit(new THREE.Mesh(lowerArmGeo, skin));
+  leftLowerArm.position.y = -0.2;
   leftElbow.add(leftLowerArm);
 
+  const leftHand = setLit(new THREE.Mesh(new THREE.SphereGeometry(0.085, 14, 12), skin));
+  leftHand.position.y = -0.39;
+  leftElbow.add(leftHand);
+
   const rightShoulder = new THREE.Group();
-  rightShoulder.position.set(0.43, 0.73, 0);
+  rightShoulder.position.set(0.43, 0.74, 0);
   spinePivot.add(rightShoulder);
+
+  const rightShoulderJoint = leftShoulderJoint.clone();
+  rightShoulder.add(rightShoulderJoint);
 
   const rightUpperArm = leftUpperArm.clone();
   rightShoulder.add(rightUpperArm);
 
   const rightElbow = new THREE.Group();
-  rightElbow.position.y = -0.48;
+  rightElbow.position.y = -0.44;
   rightShoulder.add(rightElbow);
 
   const rightLowerArm = leftLowerArm.clone();
   rightElbow.add(rightLowerArm);
 
+  const rightHand = leftHand.clone();
+  rightElbow.add(rightHand);
+
   const leftLegHip = new THREE.Group();
-  leftLegHip.position.set(-0.19, -0.02, 0);
+  leftLegHip.position.set(-0.19, -0.04, 0);
   hips.add(leftLegHip);
 
-  const leftUpperLeg = new THREE.Mesh(new THREE.CylinderGeometry(0.11, 0.12, 0.56, 14), pants);
+  const leftUpperLeg = setLit(new THREE.Mesh(upperLegGeo, pants));
   leftUpperLeg.position.y = -0.28;
-  leftUpperLeg.castShadow = true;
   leftLegHip.add(leftUpperLeg);
 
   const leftKnee = new THREE.Group();
-  leftKnee.position.y = -0.56;
+  leftKnee.position.y = -0.58;
   leftLegHip.add(leftKnee);
 
-  const leftLowerLeg = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.1, 0.56, 14), pants);
-  leftLowerLeg.position.y = -0.28;
-  leftLowerLeg.castShadow = true;
+  const leftLowerLeg = setLit(new THREE.Mesh(lowerLegGeo, pants));
+  leftLowerLeg.position.y = -0.27;
   leftKnee.add(leftLowerLeg);
 
-  const leftFoot = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.08, 0.35), shoes);
-  leftFoot.position.set(0, -0.62, 0.09);
-  leftFoot.castShadow = true;
+  const leftFoot = setLit(new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.1, 0.39), shoes));
+  leftFoot.position.set(0, -0.58, 0.11);
   leftKnee.add(leftFoot);
 
   const rightLegHip = new THREE.Group();
-  rightLegHip.position.set(0.19, -0.02, 0);
+  rightLegHip.position.set(0.19, -0.04, 0);
   hips.add(rightLegHip);
 
   const rightUpperLeg = leftUpperLeg.clone();
@@ -1439,10 +1548,21 @@ function createRagdollVisualGroup() {
   for (const [name, spec] of Object.entries(RAGDOLL_SPEC)) {
     let geometry;
 
-    if (spec.type === "box") {
+    if (spec.type === "sphere") {
+      geometry = new THREE.SphereGeometry(spec.radius, 20, 16);
+    } else if (
+      name === "torso" ||
+      name === "pelvis" ||
+      name.includes("Arm") ||
+      name.includes("Leg")
+    ) {
+      const radius = Math.min(spec.size[0], spec.size[2]) * 0.48;
+      const length = Math.max(0.05, spec.size[1] - radius * 2);
+      geometry = new THREE.CapsuleGeometry(radius, length, 6, 12);
+    } else if (spec.type === "box") {
       geometry = new THREE.BoxGeometry(spec.size[0], spec.size[1], spec.size[2]);
     } else {
-      geometry = new THREE.SphereGeometry(spec.radius, 20, 16);
+      geometry = new THREE.BoxGeometry(0.2, 0.2, 0.2);
     }
 
     const mesh = new THREE.Mesh(
